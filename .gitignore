@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.ty/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# uv / virtual environments
+.venv/
+uv.lock.tmp
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Local configuration
+.env
+.env.*
+!.env.example
+config.toml
+
+# Local app output
+activity_logs/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
