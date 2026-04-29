@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import argparse
 import base64
+import ctypes
 import importlib
 import json
 import math
+import sys
 import time
 import tomllib
 from dataclasses import dataclass
@@ -54,6 +56,7 @@ DEFAULT_COMPRESSED_MAX_EDGE = 1280
 DEFAULT_COMPRESSED_JPEG_QUALITY = 70
 DEFAULT_CHANGE_DETECTION_ENABLED = True
 DEFAULT_CHANGE_THRESHOLD = 0.015
+DESKTOP_SWITCHDESKTOP = 0x0100
 CHANGE_DETECTION_SAMPLE_SIZE = (96, 54)
 CHANGE_DETECTION_PIXEL_THRESHOLD = 12
 VALID_ACTIVITY_STATUSES = frozenset(
@@ -71,7 +74,7 @@ class AppConfig:
     api_key: str
     base_url: str
     model: str
-    interval_seconds: float
+    interval_seconds: int
     output_dir: Path
     monitor: str
     compressed_max_edge: int
@@ -103,6 +106,35 @@ class RuntimeState:
 def create_screen_capture() -> ScreenCapture:
     module = importlib.import_module("mss")
     return cast("ScreenCapture", module.MSS())
+
+
+def is_interactive_desktop_accessible() -> bool:
+    if sys.platform != "win32":
+        return True
+
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+
+    user32.OpenInputDesktop.argtypes = (
+        wintypes.DWORD,
+        wintypes.BOOL,
+        wintypes.DWORD,
+    )
+    user32.OpenInputDesktop.restype = wintypes.HANDLE
+    user32.SwitchDesktop.argtypes = (wintypes.HANDLE,)
+    user32.SwitchDesktop.restype = wintypes.BOOL
+    user32.CloseDesktop.argtypes = (wintypes.HANDLE,)
+    user32.CloseDesktop.restype = wintypes.BOOL
+
+    desktop = user32.OpenInputDesktop(0, False, DESKTOP_SWITCHDESKTOP)
+    if not desktop:
+        return False
+
+    try:
+        return bool(user32.SwitchDesktop(desktop))
+    finally:
+        user32.CloseDesktop(desktop)
 
 
 def parse_args() -> argparse.Namespace:
@@ -137,7 +169,12 @@ def load_config(path: Path) -> AppConfig:
     with path.open("rb") as file:
         data = tomllib.load(file)
 
-    interval_seconds = float(data.get("interval_seconds", 60))
+    interval_seconds_raw = data.get("interval_seconds", 60)
+    if not isinstance(interval_seconds_raw, int) or isinstance(
+        interval_seconds_raw, bool
+    ):
+        raise ValueError("interval_seconds must be an integer number of seconds.")
+    interval_seconds = interval_seconds_raw
     if interval_seconds <= 0:
         raise ValueError("interval_seconds must be greater than 0.")
 
@@ -277,12 +314,13 @@ def should_skip_model_call(
 
 def build_activity_prompt() -> str:
     return (
-        "Analyze the screenshot. Return only compact JSON with keys "
-        '"summary" and "status". '
-        '"summary" must be a detailed Chinese sentence, about 20 to 60 Chinese characters, '
-        "describing the visible app or webpage and the likely user activity. "
-        '"status" must be exactly one of: '
-        '"\u5de5\u4f5c", "\u5a31\u4e50", "\u5b66\u4e60", "\u5176\u4ed6".'
+        "请分析这张屏幕截图。只返回紧凑 JSON，包含 "
+        '"summary" 和 "status" 两个键。'
+        '"summary" 必须是一句详细的中文，约 20 到 60 个汉字，'
+        "描述可见的应用或网页，以及用户可能正在进行的活动。"
+        "知乎算是娱乐。"
+        '"status" 必须严格为以下选项之一：'
+        '"工作", "娱乐", "学习", "其他".'
     )
 
 
@@ -369,17 +407,11 @@ def format_log_time(value: datetime) -> str:
     return value.isoformat(timespec="seconds")
 
 
-def normalize_duration_seconds(value: float) -> int | float:
-    if value.is_integer():
-        return int(value)
-    return value
-
-
 def build_log_entry(
     config: AppConfig,
     capture: CaptureResult,
     analysis: ActivityAnalysis,
-    duration_seconds: int | float,
+    duration_seconds: int,
     skipped_model: bool,
     change_ratio: float | None,
 ) -> dict[str, Any]:
@@ -392,6 +424,24 @@ def build_log_entry(
         "model": config.model,
         "model_skipped": skipped_model,
         "change_ratio": change_ratio,
+    }
+
+
+def build_locked_log_entry(
+    config: AppConfig,
+    captured_at: datetime,
+    duration_seconds: int,
+) -> dict[str, Any]:
+    return {
+        "screenshot_time": format_log_time(captured_at),
+        "duration_seconds": duration_seconds,
+        "screenshot": None,
+        "summary": "屏幕处于锁定状态",
+        "status": "其他",
+        "model": config.model,
+        "model_skipped": True,
+        "change_ratio": None,
+        "screen_locked": True,
     }
 
 
@@ -412,17 +462,25 @@ def copy_previous_log_entry(
     return entry
 
 
-def append_log(
-    config: AppConfig, capture: CaptureResult, entry: dict[str, Any]
+def append_log_entry(
+    config: AppConfig,
+    captured_at: datetime,
+    entry: dict[str, Any],
 ) -> None:
     config.output_dir.mkdir(parents=True, exist_ok=True)
-    log_path = config.output_dir / f"{capture.captured_at:%Y%m%d}.jsonl"
+    log_path = config.output_dir / f"{captured_at:%Y%m%d}.jsonl"
     line = json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n"
     with log_path.open("a", encoding="utf-8") as file:
         file.write(line)
 
 
-def next_aligned_start(now: datetime, interval_seconds: float) -> datetime:
+def append_log(
+    config: AppConfig, capture: CaptureResult, entry: dict[str, Any]
+) -> None:
+    append_log_entry(config, capture.captured_at, entry)
+
+
+def next_aligned_start(now: datetime, interval_seconds: int) -> datetime:
     day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     seconds_since_day_start = (now - day_start).total_seconds()
     next_offset = (
@@ -431,7 +489,7 @@ def next_aligned_start(now: datetime, interval_seconds: float) -> datetime:
     return day_start + timedelta(seconds=next_offset)
 
 
-def wait_for_next_aligned_start(interval_seconds: float) -> datetime:
+def wait_for_next_aligned_start(interval_seconds: int) -> datetime:
     scheduled_time = next_aligned_start(datetime.now(), interval_seconds)
     sleep_seconds = max(0.0, (scheduled_time - datetime.now()).total_seconds())
     if sleep_seconds > 0:
@@ -443,8 +501,18 @@ def run_once(
     config: AppConfig,
     dry_run_model: bool,
     state: RuntimeState,
-    duration_seconds: int | float,
+    duration_seconds: int,
 ) -> None:
+    if not is_interactive_desktop_accessible():
+        captured_at = datetime.now()
+        entry = build_locked_log_entry(config, captured_at, duration_seconds)
+        state.previous_compact_path = None
+        state.previous_analysis = None
+        state.previous_entry = entry
+        append_log_entry(config, captured_at, entry)
+        print(json.dumps(entry, ensure_ascii=False, separators=(",", ":")))
+        return
+
     capture = capture_screen(config)
     skipped_model = False
     change_ratio: float | None = None
@@ -496,7 +564,6 @@ def main() -> int:
     args = parse_args()
     config = load_config(args.config)
     state = RuntimeState()
-    duration_seconds = normalize_duration_seconds(config.interval_seconds)
 
     try:
         while True:
@@ -506,7 +573,7 @@ def main() -> int:
                 config=config,
                 dry_run_model=args.dry_run_model,
                 state=state,
-                duration_seconds=duration_seconds,
+                duration_seconds=config.interval_seconds,
             )
             if args.once:
                 break
